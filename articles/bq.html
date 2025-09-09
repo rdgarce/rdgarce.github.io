@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+    
+<head>
+    <link rel="stylesheet" href="../style.css">
+    <meta charset="UTF-8">
+    <title>Raffaele del Gaudio | Are you sure you can implement a queue?</title>
+</head>
+<body>
+<h1>Are you sure you can implement a queue?</h1>
+<p>
+Many times on work and in personal project I needed a queue; for instance when I needed to save the bytes received from a UART
+and later process them without losses or when I was trying to
+<a href="read_faster_than_stdio.html">read a file faster than stdio</a>.
+Basically, any time you need two entities to asynchronously communicate in a FIFO pattern, you can use a queue.
+</p>
+<p>
+One of the possible implementations of a queue is commonly known as
+<a href="https://en.wikipedia.org/wiki/Circular_buffer" target="_blank">circular buffer</a>.
+With this straight forward implementation you use a fixed size buffer and track the head and tail to know where to read and write.
+If you look at the results your browser shows you when searching for circular buffer implementations, or ask ChatGPT to give you one,
+you will end up having more or less something like this:
+</p>
+
+<div class="code-block">
+typedef struct
+{
+    uint8_t *data;
+    size_t head;
+    size_t tail;
+    size_t nelem;
+    size_t size;
+} ByteQueue;
+
+void queue_init(ByteQueue *q, uint8_t *buffer, size_t size)
+{
+    q->data = buffer;
+    q->size = size;
+    q->head = 0;
+    q->tail = 0;
+    q->nelem = 0;
+}
+
+bool queue_push(ByteQueue *q, uint8_t byte)
+{
+    bool ok = false;
+    if (q->nelem < q->size)
+    {
+        q->data[q->tail] = byte;
+        q->tail = (q->tail + 1) % q->size;
+        q->nelem++;
+        ok = true;
+    }
+    return ok;
+}
+
+bool queue_pop(ByteQueue *q, uint8_t *byte)
+{
+    bool ok = false;
+    if (q->nelem > 0)
+    {
+        *byte = q->data[q->head];
+        q->head = (q->head + 1) % q->size;
+        q->nelem--;
+        ok = true;
+    }
+    return ok;
+}
+</div>
+
+<p>
+For the sake of future references, let's name the previous implementation "Basic Byte Queue (BBQ)".
+</p>
+<p>
+I have always felt some discomfort in using this implementation but only recently I stopped and thought for some time about
+creating a better version of it. This article shows the process of thought required to change this implementation to something
+that is 1000x faster, more elegant and also provides more features. To put things in perspective, 1000x is the difference between
+processing 1 GB of data in 30 ms instead of 30 s!
+</p>
+
+<h2>Changing the API</h2>
+
+<p>
+The first thought on this implementation is about the API: Why do we need to call the queue_push/queue_pop for each byte
+we want to push/pop? Wouldn't be better for performance if we can give the queue all the bytes to be pushed and receive back
+a number indicating how many of them were effectively pushed, and the same for pop operation? The answer is undoubtedly yes,
+because any time there's a function call you have at least the overhead caused by the memory accesses needed to prepare the
+<a href="https://en.wikipedia.org/wiki/Call_stack#STACK-FRAME" target="_blank">stack frame</a> and jump to the function.
+Apart from this overhead, you also have a number of operations that you could perform once for all the byte to push/pop
+instead of doing them for each single byte.
+</p>
+<p>
+This is how the queue_push and queue_pop operations look like with this modification:
+</p>
+
+<div class="code-block">
+size_t queue_push_vector(ByteQueue *q, const uint8_t *bytes, size_t count)
+{
+    size_t tailcopy_size;
+    size_t total = 0;
+
+    if (q->head < q->tail || q->nelem == 0)
+    {
+        tailcopy_size = MIN(q->size - q->tail, count);
+        memcpy(q->data + q->tail, bytes, tailcopy_size);
+        q->tail = (q->tail + tailcopy_size) % q->size;
+        total += tailcopy_size;
+    }
+
+    size_t headcopy_size = MIN(q->head - q->tail, count - tailcopy_size);
+    if (headcopy_size > 0)
+    {
+        memcpy(q->data + q->tail, bytes + tailcopy_size, headcopy_size);
+        q->tail += headcopy_size;
+        total += headcopy_size;
+    }
+    
+    q->nelem += total;    
+
+    return total;
+}
+
+size_t queue_pop_vector(ByteQueue *q, uint8_t *bytes, size_t count)
+{
+    if (q->nelem == 0) return 0;
+
+    if (q->head < q->tail)
+    {
+        size_t to_pop = MIN(q->tail - q->head, count);
+        memcpy(bytes, q->data + q->head, to_pop);
+        q->head = (q->head + to_pop) % q->size;
+        q->nelem -= to_pop;
+        return to_pop;
+    }
+    else
+    {
+        // q->head >= q->tail
+        size_t frst_pop = MIN(q->size - q->head, count);
+        memcpy(bytes, q->data + q->head, frst_pop);
+        q->head = (q->head + frst_pop) % q->size;
+        q->nelem -= frst_pop;
+        
+        size_t scnd_pop = MIN(q->tail - q->head, count - frst_pop);
+        if (scnd_pop > 0)
+        {
+            memcpy(bytes + frst_pop, q->data + q->head, scnd_pop);
+            q->head = (q->head + scnd_pop) % q->size;
+            q->nelem -= scnd_pop;
+        }
+
+        return frst_pop + scnd_pop;
+    }
+}
+</div>
+
+<p>
+Let's call this implementation the "Vectorial Byte Queue (VBQ)".
+</p>
+
+<p>
+With this API, the push operation expects a pointer to an array of bytes and its length and tries to copy all of them in the queue.
+The pop operation does something similar in the opposite direction. 
+</p>
+
+<h2>Removing unnecessary copies</h2>
+
+<p>
+The second modification comes by noticing that the most expensive operation on computers in terms of latency is accessing memory.
+Roughly, accessing RAM requires 10x the time needed to access L2 cache, and accessing the L2 requires 10x the time needed for accessing the L1.
+</p>
+
+<p>
+The rule of thumb here is: <b>always avoid unnecessary copies!</b>
+</p>
+
+<p>
+We are actually doing an unnecessary copy in the previous implementation because the push operation could provide a direct pointer to the
+internal queue memory and the maximum number of bytes the user can write, and the same applies for the pop operation.
+</p>
+
+<p>
+This is how the two operations look like after applying this change:
+</p>
+
+<div class="code-block">
+void *queue_get_push_buf(ByteQueue *q, size_t *len)
+{
+    if (q->head < q->tail || q->nelem == 0)
+        *len = q->size - q->tail;
+    else // q->head >= q->tail
+        *len = q->head - q->tail;
+
+    return q->data + q->tail;
+}
+
+void queue_commit_push(ByteQueue *q, size_t len)
+{
+    q->tail = (q->tail + len) % q->size;
+    q->nelem += len;
+}
+
+void *queue_get_pop_buf(ByteQueue *q, size_t *len)
+{
+    if (q->head < q->tail || q->nelem == 0)
+        *len = q->tail - q->head;
+    else // q->head >= q->tail
+        *len = q->size - q->head;
+
+    return q->data + q->head;
+}
+
+void queue_commit_pop(ByteQueue *q, size_t len)
+{
+    q->head = (q->head + len) % q->size;
+    q->nelem -= len;
+}
+</div>
+
+<p>
+Let's call this implementation the "Acked Byte Queue (ABQ)".
+</p>
+
+<p>
+With this, the user needs to commit the operations to inform the queue on how much bytes he pushed or popped but you
+can clearly see that this code allows the program to skip one useless data copy.
+</p>
+
+<h2>Making it MT-safe and lock-free</h2>
+
+<p>
+Another step forward could be reducing the internal state using only two of three variable <code class="inline-code">head, tail, nelem</code>.
+The reason for having all three of them is because when <code class="inline-code">head == tail</code> you have no way of telling
+if the queue is empty or full after the producer filled it. Some implementations remove the nelem variable and store special a value
+(-1) in <code class="inline-code">head</code> and <code class="inline-code">tail</code> when the queue is empty, others remove the
+<code class="inline-code">tail</code> and only use <code class="inline-code">head, nelem</code>. The reality is that there is a third
+possible implementation that uses <code class="inline-code">head, tail</code> without storing a special value in those to signal the emptyness.
+</p>
+
+<p>
+If we store <code class="inline-code">head</code> and <code class="inline-code">tail</code> as is, without doing the modulo,
+the <code class="inline-code">tail</code> will always be bigger or equal to <code class="inline-code">head</code> and to calculate the length
+of the available memory to push or pop, we will check if head and <code class="inline-code">tail</code> are in the same block of
+<code class="inline-code">q->size</code> bytes. We are almost there but there's a feature we would love our queue to have: multithreaded usage.
+</p>
+
+<p>
+By using <code class="inline-code">head, tail</code>, we gain the additional benefit that the queue can be made MT-safe with only minimal
+modification. It can even be lock-free: even if a data race occurs between the producer and consumer, each thread only updates
+its own variable. Moreover, any stale value still corresponds to a valid queue state, so no undefined behavior occurs.
+</p>
+
+<p>
+The only needed thing is that <code class="inline-code">head, tail</code> are updated with
+<a href="https://en.wikipedia.org/wiki/Consistency_model" target="_blank">release consistency</a> to be sure that the buffer memory is updated
+before the state variable. If <code class="inline-code">head, nelem</code> is chosen, you need to atomically modify both in the consumer
+after a pop or you would have an incorrect state. This leads to the need for a lock or to store both variable in a
+single word accessible atomically, but this seems to me too much of a trick considering the previous option.
+</p>
+
+<p>
+This is how the operations look like after applying the two previous observation:
+</p>
+
+<div class="code-block">
+void *queue_get_push_buf(ByteQueue *q, size_t *len)
+{
+    // This private copy of head is essential to have a coherent
+    // value throughout the function, regardless of the consumer's
+    // actions.
+    size_t head = q->head;
+    size_t head_n_wrap = head / q->size;
+    size_t tail_n_wrap = q->tail / q->size;
+
+    if (head_n_wrap == tail_n_wrap)
+        // head and tail are in the same block of
+        // q->size bytes
+        *len = q->size - (q->tail % q->size);
+    else
+        *len = q->size - (q->tail - head);
+
+    return q->data + (q->tail % q->size);
+}
+
+void queue_commit_push(ByteQueue *q, size_t len)
+{
+    __atomic_store_n(&q->tail, q->tail + len, __ATOMIC_RELEASE);
+}
+
+void *queue_get_pop_buf(ByteQueue *q, size_t *len)
+{
+    // This private copy of tail is essential to have a coherent
+    // value throughout the function, regardless of the consumer's
+    // actions.
+    size_t tail = q->tail;
+    size_t head_n_wrap = q->head / q->size;
+    size_t tail_n_wrap = tail / q->size;
+
+    if (head_n_wrap == tail_n_wrap)
+        // head and tail are in the same block of
+        // q->size bytes
+        *len = tail - q->head;
+    else // q->head >= q->tail
+        *len = tail - q->head - (tail % q->size);
+
+    return q->data + (q->head % q->size);
+}
+
+void queue_commit_pop(ByteQueue *q, size_t len)
+{
+    __atomic_store_n(&q->head, q->head + len, __ATOMIC_RELEASE);
+}
+</div>
+
+<p>
+Let's call this implementation the "Lock-Free Queue (LFQ)".
+</p>
+<p>
+A small but crucial detail in a multithreaded scenario is the use of a private copy of <code class="inline-code">head</code> in the push
+operation and of <code class="inline-code">tail</code> in the pop operation. If you don’t read these variables into a local copy and
+only use that, you can possibly end up using different values throughout the function computations, which may lead to incorrect results.
+</p>
+
+<h2>Removing divisions and branches</h2>
+
+<p>
+There are other two small improvements that we can make:
+</p>
+
+<ol>
+    <li>eliminate the usage of divisions and modulo operations, by the assumption that they are more costly than simple additions,
+        subtractions and bit operations,</li>
+    <li>remove any if statement to create a complete branchless implementation.</li>
+</ol>
+
+<p>
+The first improvement comes from imposing a power of two for the length of the underlying buffer. If that's the case, any division become a
+right shift and any modulo become a bitwise and. Removing the if statements is possible by noticing that
+<code class="inline-code">head_n_wrap, tail_n_wrap</code> will always differ by at most 1.
+Precisely <code class="inline-code">head_n_wrap == tail_n_wrap</code> iff <code class="inline-code">tail</code> is in the same
+block of <code class="inline-code">q->size</code> bytes or
+<code class="inline-code">head_n_wrap == tail_n_wrap - 1</code> iff <code class="inline-code">tail</code> is in the next block.
+You can never have a difference that is bigger than 1 because the queue will be full before that can happen.
+</p>
+
+<p>
+Let's have a look at a piece of the final implementation available in the <a href="https://github.com/rdgarce/bq" target="_blank">github repo</a>:
+</p>
+
+<div class="code-block">
+static void *bq_popbuf(bq *q, size_t *len)
+{
+    size_t tail = q->tail;
+    size_t cond = (tail >> q->cap_lg2) - (q->head >> q->cap_lg2);
+    *len = tail - q->head - (tail & q->mask) * cond;
+
+    return q->data + (q->head & q->mask);
+}
+
+static void bq_pop(bq *q, size_t count)
+{
+    __atomic_store_n(&q->head, q->head + count, __ATOMIC_RELEASE);
+}
+
+static void *bq_pushbuf(bq *q, size_t *len)
+{
+    size_t head = q->head;
+    size_t cond = (q->tail >> q->cap_lg2) - (head >> q->cap_lg2);
+    *len = q->mask + 1 - (q->tail - head) - (q->head & q->mask) * (1 - cond);
+
+    return q->data + (q->tail & q->mask);
+}
+
+static void bq_push(bq *q, size_t count)
+{
+    __atomic_store_n(&q->tail, q->tail + count, __ATOMIC_RELEASE);
+}
+</div>
+
+<p>
+Let's call this implementation the "Byte Queue (BQ)".
+</p>
+
+<p>
+Have a look at the <code class="inline-code">cond</code> variable and how, given that the queue length is a power of two, can be calculated
+with two bit shift and a subtraction. The <code class="inline-code">cond</code> variable is directly multiplied such to condition the
+calculation of the available lengths for push and pop operations.
+</p>
+
+<h2>Perfomance comparison</h2>
+
+<p>
+Now let's have some fun and compare the speed of these different implementations. <b>Note:</b> Since they are tested in a two-threads scenario,
+we need to add a mutex to protect the BBQ, VBQ and ABQ operations so that they become MT-safe.
+</p>
+
+<p>
+The following plot compares the time required to transfer 1 GB of data through the queues. The queue size is fixed at 1 MB, and the plot shows
+the clock cycles per byte as a function of the maximum number of bytes allowed per operation.
+</p>
+
+<img src="media/queue_comparation.svg" alt="Processing 1 GB of data on queues of 1MB of length" style="width: 100%; height: auto;">
+
+<p>
+We can see that the major source of overhead reduction is from BBQ to VBQ because of the elimination of all those function calls.
+This optimization alone generate a minimum reduction of 8x and a maximum of roughly 1600x in the number of cycles per byte and the
+performance gain you get from this optimization grows with how much data you can process per operation.
+</p>
+
+<p>
+The second most impacting optimization is the one from VBQ to ABQ because of the reduction of the unnecessary copy. The performance
+gain you get from this optimization grows with how much data you can process per operation; indeed you get 20%/30% reduction with relatively
+few bytes per operation but if you can move more than 64 KB per operation you can get more than 2x reduction in the number of cycles per byte.
+</p>
+
+<p>
+The performance gain you get from the last two optimizations (LFQ and BQ) decreases with how much data you can process per operation because,
+when moving a lot of bytes at once, the clock cycles needed to lock and unlock the mutex and do divisions and modulo operations are very few
+compared to those needed to actually move the data. In other words, if you are able to move a lot of bytes per operation, the number of calls
+to the queue functions will be small and so the performance increase from their optimization. That said, when moving 64 Bytes or 512 B per
+operation you get roughly 18% reduction in the number of cycles per byte: not bad!
+</p>
+
+<h2>Any feedback?</h2>
+
+<p>
+If you have any questions or feedback regarding this article, you can find my contact information on the <a href="../index.html">homepage</a>.
+</p>
+
+
+</body>
+</html>
