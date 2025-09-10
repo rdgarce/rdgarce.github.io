@@ -9,17 +9,14 @@
 <body>
 <h1>Are you sure you can implement a queue?</h1>
 <p>
-Many times on work and in personal project I needed a queue; for instance when I needed to save the bytes received from a UART
-and later process them without losses or when I was trying to
-<a href="read_faster_than_stdio.html">read a file faster than stdio</a>.
-Basically, any time you need two entities to asynchronously communicate in a FIFO pattern, you can use a queue.
+I often use queues for work and in personal projects, and I think you do too; for instance you may need to save bytes received from an UART for
+later processing, or to <a href="read_faster_than_stdio.html">read from a file faster than stdio</a>. Any time you need two entities
+to communicate asynchronously in a FIFO pattern, you use a queue.
 </p>
 <p>
-One of the possible implementations of a queue is commonly known as
-<a href="https://en.wikipedia.org/wiki/Circular_buffer" target="_blank">circular buffer</a>.
-With this straight forward implementation you use a fixed size buffer and track the head and tail to know where to read and write.
-If you look at the results your browser shows you when searching for circular buffer implementations, or ask ChatGPT to give you one,
-you will end up having more or less something like this:
+The most common implementation of a queue is the <a href="https://en.wikipedia.org/wiki/Circular_buffer" target="_blank">circular buffer</a>,
+which uses a fixed-size buffer and two cursors over it, usually referred to as <i>head</i> and <i>tail</i>. They index the location of the next read
+and the next write. If you were to google for a queue implementation or ask ChatGPT to implement one, you would probably get something like this one:
 </p>
 
 <div class="code-block">
@@ -72,21 +69,24 @@ bool queue_pop(ByteQueue *q, uint8_t *byte)
 For the sake of future references, let's name the previous implementation "Basic Byte Queue (BBQ)".
 </p>
 <p>
-I have always felt some discomfort in using this implementation but only recently I stopped and thought for some time about
-creating a better version of it. This article shows the process of thought required to change this implementation to something
-that is 1000x faster, more elegant and also provides more features. To put things in perspective, 1000x is the difference between
-processing 1 GB of data in 30 ms instead of 30 s!
+I used this style of queue for quite a bit of time, but always felt unease as I had the feeling it could be improved quite a bit.
+Only recently I stopped and thought about how it could be improved. So, this article shows my process of improvement and how I got
+to an implementation that is 1000x faster, more elegant, and that provides more features.To put things in perspective, 1000x is
+the difference between processing 1 GB of data in 30 ms instead of 30 s!
+</p>
+
+<p>
+All the code shown in this article, along with the final implementation and the tests for correctness and performance, is available
+in the <a href="https://github.com/rdgarce/bq" target="_blank">github repo</a>.
 </p>
 
 <h2>Changing the API</h2>
 
 <p>
-The first thought on this implementation is about the API: Why do we need to call the queue_push/queue_pop for each byte
-we want to push/pop? Wouldn't be better for performance if we can give the queue all the bytes to be pushed and receive back
-a number indicating how many of them were effectively pushed, and the same for pop operation? The answer is undoubtedly yes,
-because any time there's a function call you have at least the overhead caused by the memory accesses needed to prepare the
-<a href="https://en.wikipedia.org/wiki/Call_stack#STACK-FRAME" target="_blank">stack frame</a> and jump to the function.
-Apart from this overhead, you also have a number of operations that you could perform once for all the byte to push/pop
+The starting point is the API: why call the push/pop functions on each byte? Wouldn't it be better if we managed bytes in batches?
+This would greatly reduce the cost associated to function calls, such as preparing the
+<a href="https://en.wikipedia.org/wiki/Call_stack#STACK-FRAME" target="_blank">stack frame</a> and jumping to the function.
+Apart from this overhead, you also have a number of operations that you could perform once for all the bytes to push/pop
 instead of doing them for each single byte.
 </p>
 <p>
@@ -228,32 +228,40 @@ can clearly see that this code allows the program to skip one useless data copy.
 <h2>Making it MT-safe and lock-free</h2>
 
 <p>
-Another step forward could be reducing the internal state using only two of three variable <code class="inline-code">head, tail, nelem</code>.
-The reason for having all three of them is because when <code class="inline-code">head == tail</code> you have no way of telling
-if the queue is empty or full after the producer filled it. Some implementations remove the nelem variable and store special a value
-(-1) in <code class="inline-code">head</code> and <code class="inline-code">tail</code> when the queue is empty, others remove the
-<code class="inline-code">tail</code> and only use <code class="inline-code">head, nelem</code>. The reality is that there is a third
-possible implementation that uses <code class="inline-code">head, tail</code> without storing a special value in those to signal the emptyness.
+Another step forward is reducing the internal state to just two of the three variables: <code class="inline-code">head</code>,
+<code class="inline-code">tail</code>, and <code class="inline-code">nelem</code>. The reason we have them in the first place is that when
+<code class="inline-code">head == tail</code>, it’s impossible to distinguish whether the queue is empty or full once the producer
+has filled it. Some implementations remove <code class="inline-code">nelem</code> and use a special value (e.g. -1) for
+<code class="inline-code">head</code> and <code class="inline-code">tail</code> to indicate emptiness; others remove
+<code class="inline-code">tail</code> and only rely on <code class="inline-code">head</code> and <code class="inline-code">nelem</code>.
+But there’s also a third, more elegant solution: using only <code class="inline-code">head</code> and <code class="inline-code">tail</code>,
+without any special marker, while still being able to clearly distinguish between an empty and a full queue.
 </p>
 
 <p>
-If we store <code class="inline-code">head</code> and <code class="inline-code">tail</code> as is, without doing the modulo,
-the <code class="inline-code">tail</code> will always be bigger or equal to <code class="inline-code">head</code> and to calculate the length
-of the available memory to push or pop, we will check if head and <code class="inline-code">tail</code> are in the same block of
-<code class="inline-code">q->size</code> bytes. We are almost there but there's a feature we would love our queue to have: multithreaded usage.
+If <code class="inline-code">head</code> and <code class="inline-code">tail</code> are stored as is, without doing the modulo, and
+the needed checks are performed before applying the modulo to the variables, we can disambiguate the two scenarios because
+<code class="inline-code">head == tail</code> is true iff the queue is empty. Then, when accessing the buffer is needed,
+the modulo can be performed to obtain the index.
 </p>
 
 <p>
-By using <code class="inline-code">head, tail</code>, we gain the additional benefit that the queue can be made MT-safe with only minimal
-modification. It can even be lock-free: even if a data race occurs between the producer and consumer, each thread only updates
-its own variable. Moreover, any stale value still corresponds to a valid queue state, so no undefined behavior occurs.
+We are almost there but there's a feature we would love our queue to have: multithreaded usage.
 </p>
 
 <p>
-The only needed thing is that <code class="inline-code">head, tail</code> are updated with
+By using <code class="inline-code">head</code> and <code class="inline-code">tail</code>, we gain the additional benefit that the queue can be made MT-safe with only minimal
+modification. If we only allow one producer thread and one consumer thread, we can even avoid locks, making it entirely lock-free. This
+holds because, even if a data race occurs between the producer and consumer, each thread only updates its own variable and any stale value still
+corresponds to a valid queue state, so no undefined behavior occurs.
+</p>
+
+<p>
+The only needed thing is that <code class="inline-code">head</code> and <code class="inline-code">tail</code> are updated with
 <a href="https://en.wikipedia.org/wiki/Consistency_model" target="_blank">release consistency</a> to be sure that the buffer memory is updated
-before the state variable. If <code class="inline-code">head, nelem</code> is chosen, you need to atomically modify both in the consumer
-after a pop or you would have an incorrect state. This leads to the need for a lock or to store both variable in a
+before them.
+If <code class="inline-code">head</code> and <code class="inline-code">nelem</code> are chosen to represent the state, you need to atomically
+modify both in the consumer after a pop or you would have an incorrect state. This leads to the need for a lock or to store both variable in a
 single word accessible atomically, but this seems to me too much of a trick considering the previous option.
 </p>
 
@@ -323,24 +331,13 @@ only use that, you can possibly end up using different values throughout the fun
 <h2>Removing divisions and branches</h2>
 
 <p>
-There are other two small improvements that we can make:
+There are other two improvements that we can make:
 </p>
 
 <ol>
-    <li>eliminate the usage of divisions and modulo operations, by the assumption that they are more costly than simple additions,
-        subtractions and bit operations,</li>
-    <li>remove any if statement to create a complete branchless implementation.</li>
+    <li>Eliminate divisions and modulo operations with bitwise shifts and ANDs, which is possible if we impose that the queue's capacity is a power of 2.</li>
+    <li>Remove the if statements to make the implementation completely branchless</li>
 </ol>
-
-<p>
-The first improvement comes from imposing a power of two for the length of the underlying buffer. If that's the case, any division become a
-right shift and any modulo become a bitwise and. Removing the if statements is possible by noticing that
-<code class="inline-code">head_n_wrap, tail_n_wrap</code> will always differ by at most 1.
-Precisely <code class="inline-code">head_n_wrap == tail_n_wrap</code> iff <code class="inline-code">tail</code> is in the same
-block of <code class="inline-code">q->size</code> bytes or
-<code class="inline-code">head_n_wrap == tail_n_wrap - 1</code> iff <code class="inline-code">tail</code> is in the next block.
-You can never have a difference that is bigger than 1 because the queue will be full before that can happen.
-</p>
 
 <p>
 Let's have a look at a piece of the final implementation available in the <a href="https://github.com/rdgarce/bq" target="_blank">github repo</a>:
@@ -381,9 +378,8 @@ Let's call this implementation the "Byte Queue (BQ)".
 </p>
 
 <p>
-Have a look at the <code class="inline-code">cond</code> variable and how, given that the queue length is a power of two, can be calculated
-with two bit shift and a subtraction. The <code class="inline-code">cond</code> variable is directly multiplied such to condition the
-calculation of the available lengths for push and pop operations.
+We managed to eliminate the if statements by observing that <code class="inline-code">head_n_wrap</code> and
+<code class="inline-code">tail_n_wrap</code> can only differ by 0 or 1. This allowed us to collapse the if/else branches into a single multiplication.
 </p>
 
 <h2>Perfomance comparison</h2>
