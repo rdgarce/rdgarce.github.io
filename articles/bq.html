@@ -10,7 +10,7 @@
 <h1>Are you sure you can implement a queue?</h1>
 <p>
 I often use queues for work and in personal projects, and I think you do too; for instance you may need to save bytes received from an UART for
-later processing, or to <a href="read_faster_than_stdio.html">read from a file faster than stdio</a>. Any time you need two entities
+later processing, or to <a href="read_faster_than_stdio.html">read from a file faster than stdio</a>. Anytime you need two entities
 to communicate asynchronously in a FIFO pattern, you use a queue.
 </p>
 <p>
@@ -158,7 +158,7 @@ Let's call this implementation the "Vectorial Byte Queue (VBQ)".
 </p>
 
 <p>
-With this API, the push operation expects a pointer to an array of bytes and its length and tries to copy all of them in the queue.
+With this API, the push operation expects a pointer to an array of bytes and its length and it tries to copy all of them in the queue.
 The pop operation does something similar in the opposite direction. 
 </p>
 
@@ -251,7 +251,7 @@ We are almost there but there's a feature we would love our queue to have: multi
 
 <p>
 By using <code class="inline-code">head</code> and <code class="inline-code">tail</code>, we gain the additional benefit that the queue can be made MT-safe with only minimal
-modification. If we only allow one producer thread and one consumer thread, we can even avoid locks, making it entirely lock-free. This
+modification. If we only allow one producer thread and one consumer thread, we can even avoid locks, making the implementation entirely lock-free. This
 holds because, even if a data race occurs between the producer and consumer, each thread only updates its own variable and any stale value still
 corresponds to a valid queue state, so no undefined behavior occurs.
 </p>
@@ -266,7 +266,7 @@ single word accessible atomically, but this seems to me too much of a trick cons
 </p>
 
 <p>
-This is how the operations look like after applying the two previous observation:
+This is how the operations look like after applying the two previous observations:
 </p>
 
 <div class="code-block">
@@ -336,7 +336,7 @@ There are other two improvements that we can make:
 
 <ol>
     <li>Eliminate divisions and modulo operations with bitwise shifts and ANDs, which is possible if we impose that the queue's capacity is a power of 2.</li>
-    <li>Remove the if statements to make the implementation completely branchless</li>
+    <li>Remove the if statements to make the implementation completely branchless.</li>
 </ol>
 
 <p>
@@ -398,7 +398,7 @@ the clock cycles per byte as a function of the maximum number of bytes allowed p
 
 <p>
 We can see that the major source of overhead reduction is from BBQ to VBQ because of the elimination of all those function calls.
-This optimization alone generate a minimum reduction of 8x and a maximum of roughly 1600x in the number of cycles per byte and the
+This optimization alone generates a minimum reduction of 8x and a maximum of roughly 1600x in the number of cycles per byte and the
 performance gain you get from this optimization grows with how much data you can process per operation.
 </p>
 
@@ -412,7 +412,7 @@ few bytes per operation but if you can move more than 64 KB per operation you ca
 The performance gain you get from the last two optimizations (LFQ and BQ) decreases with how much data you can process per operation because,
 when moving a lot of bytes at once, the clock cycles needed to lock and unlock the mutex and do divisions and modulo operations are very few
 compared to those needed to actually move the data. In other words, if you are able to move a lot of bytes per operation, the number of calls
-to the queue functions will be small and so the performance increase from their optimization. That said, when moving 64 Bytes or 512 B per
+to the queue functions will decrease, so optimizing them will have less impact on performance. That said, when moving 64 Bytes or 512 Bytes per
 operation you get roughly 18% reduction in the number of cycles per byte: not bad!
 </p>
 
