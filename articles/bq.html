@@ -12,7 +12,7 @@
 <p><i>Published on 10 September 2025</i></p>
 
 <p>
-I often use queues for work and in personal projects, and I think you do too; for instance you may need to save bytes received from an UART for
+I often use queues for work and in personal projects, and I think you do too; for instance you may need to save bytes received from a socket for
 later processing, or to <a href="read_faster_than_stdio.html">read from a file faster than stdio</a>. Anytime you need two entities
 to communicate asynchronously in a FIFO pattern, you use a queue.
 </p>
@@ -228,7 +228,7 @@ With this, the user needs to commit the operations to inform the queue on how mu
 can clearly see that this code allows the program to skip one useless data copy.
 </p>
 
-<h2>Making it MT-safe and lock-free</h2>
+<h2>Optimizing the state representation</h2>
 
 <p>
 Another step forward is reducing the internal state to just two of the three variables: <code class="inline-code">head</code>,
@@ -242,30 +242,42 @@ without any special marker, while still being able to clearly distinguish betwee
 </p>
 
 <p>
-If <code class="inline-code">head</code> and <code class="inline-code">tail</code> are stored as is, without doing the modulo, and
-the needed checks are performed before applying the modulo to the variables, we can disambiguate the two scenarios because
-<code class="inline-code">head == tail</code> is true iff the queue is empty. Then, when accessing the buffer is needed,
-the modulo can be performed to obtain the index.
+By restricting the queue length to a power of two and keeping <code class="inline-code">head</code> and <code class="inline-code">tail</code>
+as ever-increasing counters (without applying modulo immediately), it becomes straightforward to distinguish between an empty and a full queue.
+In this scheme, <code class="inline-code">head == tail</code> always indicates that the queue is empty, while
+<code class="inline-code">(tail - head) == capacity</code> always indicates that it is full. Even when <code class="inline-code">tail</code>
+overflows and wraps around <code class="inline-code">SIZE_MAX</code>, the implicit modulo arithmetic
+<code class="inline-code">(mod SIZE_MAX+1)</code> ensures correctness. The actual index into the buffer can then be computed by applying the
+modulo operation only when needed for access.
 </p>
 
 <p>
-We are almost there but there's a feature we would love our queue to have: multithreaded usage.
+<div class="note">
+<b>NOTE</b>: When storing head and tail without the modulo, the queue length MUST be a power of 2, otherwise the implicit modulo will lead
+to incorrect states. As an example (provided by skeeto while reviewing this article):
+Suppose the queue has <code class="inline-code">capacity == 3</code>, and currently <code class="inline-code">head == SIZE_MAX</code>,
+about to tick over to zero. To pop the next element you access <code class="inline-code">data[head % 3] == data[0]</code>, because
+<code class="inline-code">SIZE_MAX % 3 == 0</code>. After the pop, you update:
+<code class="inline-code">head = head + 1 == 0</code>, because <code class="inline-code">SIZE_MAX + 1 == 0</code>.
+We've incremented head but the effective value is still zero!
+</div>
 </p>
+
+<h2>Making it MT-safe and lock-free</h2>
 
 <p>
 By using <code class="inline-code">head</code> and <code class="inline-code">tail</code>, we gain the additional benefit that the queue can be made MT-safe with only minimal
-modification. If we only allow one producer thread and one consumer thread, we can even avoid locks, making the implementation entirely lock-free. This
-holds because, even if a data race occurs between the producer and consumer, each thread only updates its own variable and any stale value still
-corresponds to a valid queue state, so no undefined behavior occurs.
+modification. If we only allow one producer thread and one consumer thread, we can even avoid locks, making the implementation entirely lock-free.
 </p>
 
 <p>
-The only needed thing is that <code class="inline-code">head</code> and <code class="inline-code">tail</code> are updated with
-<a href="https://en.wikipedia.org/wiki/Consistency_model" target="_blank">release consistency</a> to be sure that the buffer memory is updated
-before them.
-If <code class="inline-code">head</code> and <code class="inline-code">nelem</code> are chosen to represent the state, you need to atomically
-modify both in the consumer after a pop or you would have an incorrect state. This leads to the need for a lock or to store both variable in a
-single word accessible atomically, but this seems to me too much of a trick considering the previous option.
+The only needed thing is that <code class="inline-code">head</code> and <code class="inline-code">tail</code> are accessed with
+<a href="https://research.swtch.com/plmm#acqrel" target="_blank">acquire/release consistency</a> to be sure that the result of buffer memory
+is accessed in the correct order with respect with state updates.
+If <code class="inline-code">head</code> and <code class="inline-code">nelem</code> were used to represent the state,
+both would need to be updated atomically by the consumer after a pop; otherwise, the state could become inconsistent.
+This would either require a lock or storing both variables in a single word that can be updated atomically.
+Compared to the previous approach, however, this feels like an unnecessary complication.
 </p>
 
 <p>
@@ -275,10 +287,7 @@ This is how the operations look like after applying the two previous observation
 <div class="code-block">
 void *queue_get_push_buf(ByteQueue *q, size_t *len)
 {
-    // This private copy of head is essential to have a coherent
-    // value throughout the function, regardless of the consumer's
-    // actions.
-    size_t head = q->head;
+    size_t head = __atomic_load_n(&q->head, __ATOMIC_ACQUIRE);
     size_t head_n_wrap = head / q->size;
     size_t tail_n_wrap = q->tail / q->size;
 
@@ -299,10 +308,7 @@ void queue_commit_push(ByteQueue *q, size_t len)
 
 void *queue_get_pop_buf(ByteQueue *q, size_t *len)
 {
-    // This private copy of tail is essential to have a coherent
-    // value throughout the function, regardless of the consumer's
-    // actions.
-    size_t tail = q->tail;
+    size_t tail = __atomic_load_n(&q->tail, __ATOMIC_ACQUIRE);
     size_t head_n_wrap = q->head / q->size;
     size_t tail_n_wrap = tail / q->size;
 
@@ -325,11 +331,6 @@ void queue_commit_pop(ByteQueue *q, size_t len)
 <p>
 Let's call this implementation the "Lock-Free Queue (LFQ)".
 </p>
-<p>
-A small but crucial detail in a multithreaded scenario is the use of a private copy of <code class="inline-code">head</code> in the push
-operation and of <code class="inline-code">tail</code> in the pop operation. If you don’t read these variables into a local copy and
-only use that, you can possibly end up using different values throughout the function computations, which may lead to incorrect results.
-</p>
 
 <h2>Removing divisions and branches</h2>
 
@@ -338,7 +339,7 @@ There are other two improvements that we can make:
 </p>
 
 <ol>
-    <li>Eliminate divisions and modulo operations with bitwise shifts and ANDs, which is possible if we impose that the queue's capacity is a power of 2.</li>
+    <li>Eliminate divisions and modulo operations with bitwise shifts and ANDs, which comes for free by having imposed a power of 2 as length.</li>
     <li>Remove the if statements to make the implementation completely branchless.</li>
 </ol>
 
@@ -349,8 +350,14 @@ Let's have a look at a piece of the final implementation available in the <a hre
 <div class="code-block">
 static void *bq_popbuf(bq *q, size_t *len)
 {
-    size_t tail = q->tail;
-    size_t cond = (tail >> q->cap_lg2) - (q->head >> q->cap_lg2);
+    size_t tail = __atomic_load_n(&q->tail, __ATOMIC_ACQUIRE);
+    // The cond variable is 0 iff tail is in the same block of
+    // (q->mask + 1) bytes, otherwise is:
+    // -- 1, if tail is in the next block and has not wrapped around SIZE_MAX,
+    // -- A big odd negative number, when tail has wrapped around SIZE_MAX.
+    // With the final bitwise AND, we reduce the possible results to (0, 1).
+    // We use this variable to subtract from the final number conditionally.
+    size_t cond = ((tail >> q->cap_lg2) - (q->head >> q->cap_lg2)) & 0x1;
     *len = tail - q->head - (tail & q->mask) * cond;
 
     return q->data + (q->head & q->mask);
@@ -363,9 +370,15 @@ static void bq_pop(bq *q, size_t count)
 
 static void *bq_pushbuf(bq *q, size_t *len)
 {
-    size_t head = q->head;
-    size_t cond = (q->tail >> q->cap_lg2) - (head >> q->cap_lg2);
-    *len = q->mask + 1 - (q->tail - head) - (q->head & q->mask) * (1 - cond);
+    size_t head = __atomic_load_n(&q->head, __ATOMIC_ACQUIRE);
+    // The cond variable is 0 iff tail is in the same block of
+    // (q->mask + 1) bytes, otherwise is:
+    // -- 1, if tail is in the next block and has not wrapped around SIZE_MAX,
+    // -- A big odd negative number, when tail has wrapped around SIZE_MAX.
+    // With the final bitwise AND, we reduce the possible results to (0, 1).
+    // We use this variable to subtract from the final number conditionally.
+    size_t cond = ((q->tail >> q->cap_lg2) - (head >> q->cap_lg2)) & 0x1;
+    *len = q->mask + 1 - (q->tail - head) - (head & q->mask) * (1 - cond);
 
     return q->data + (q->tail & q->mask);
 }
@@ -381,15 +394,22 @@ Let's call this implementation the "Byte Queue (BQ)".
 </p>
 
 <p>
-We managed to eliminate the if statements by observing that <code class="inline-code">head_n_wrap</code> and
-<code class="inline-code">tail_n_wrap</code> can only differ by 0 or 1. This allowed us to collapse the if/else branches into a single multiplication.
+The <code class="inline-code">cond</code> variable lets us eliminate explicit if/else branches by turning the conditional adjustment of
+<code class="inline-code">*len</code> into a simple multiplication. In other words, instead of branching, we encode the
+“only when <code class="inline-code">cond == 1</code>” logic directly into the arithmetic expression.
 </p>
 
 <h2>Perfomance comparison</h2>
 
 <p>
-Now let's have some fun and compare the speed of these different implementations. <b>Note:</b> Since they are tested in a two-threads scenario,
+Now let's have some fun and compare the speed of these different implementations.
+</p>
+
+<p>
+<div class="note">
+<b>Note:</b> Since they are tested in a two-threads scenario,
 we need to add a mutex to protect the BBQ, VBQ and ABQ operations so that they become MT-safe.
+</div>
 </p>
 
 <p>
@@ -425,6 +445,11 @@ operation you get roughly 18% reduction in the number of cycles per byte: not ba
 If you have any questions or feedback regarding this article, you can find my contact information on the <a href="../index.html">homepage</a>.
 </p>
 
+<h2>Acknowledgements</h2>
+
+<a href="https://coz.is/" target="_blank">cozis</a>, <a href="https://nullprogram.com/" target="_blank">skeeto</a>
+and imachug for reviewing the article and providing insightful
+<a href="https://www.reddit.com/r/C_Programming/comments/1ne4bc0/are_you_sure_you_can_implement_a_queue" target="_blank">comments</a>.
 
 </body>
 </html>

@@ -21,13 +21,14 @@ a {
 }
 
 .code-block {
-    background-color: #f5f5f5; /* sfondo leggermente grigio */
-    color: #333;               /* testo scuro */
-    font-family: monospace;    /* monospace */
-    padding: 12px;             /* un po’ di spazio interno */
-    border-radius: 6px;        /* angoli leggermente arrotondati */
-    overflow-x: auto;          /* scroll orizzontale se il codice è lungo */
-    white-space: pre;          /* mantiene spazi e indentazione */
+    background-color: #f5f5f5;
+    color: #333;
+    font-family: monospace;
+    font-size: 0.9em;     /* più piccolo del testo base */
+    padding: 12px;
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre;
     line-height: 1.4;
 }
 
@@ -38,4 +39,14 @@ code.inline-code {
     padding: 2px 4px;          /* piccolo padding */
     border-radius: 4px;        /* angoli leggermente arrotondati */
     font-size: 0.95em;         /* leggermente più piccolo del testo normale */
+}
+
+.note {
+    display: block;              /* oppure inline-block se vuoi che non vada a capo da solo */
+    background-color: transparent;
+    border: 2px dashed #333;
+    box-shadow: none;
+    padding: 10px;               /* un po’ di spazio interno */
+    margin: 10px 0;              /* distacco sopra e sotto */
+    border-radius: 6px;          /* opzionale */
 }
